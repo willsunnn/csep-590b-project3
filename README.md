@@ -19,14 +19,6 @@ A high-performance, scalable cloud application designed for a mid-size retailer.
 ├── cdk/                    # Infrastructure as Code (AWS CDK)
 │   ├── bin/                # CDK entry point
 │   ├── lib/                # Infrastructure stack definition (VPC, EKS, RDS, etc.)
-│   └── test/               # CDK infrastructure tests
-├── order-service/          # Application source code
-│   ├── api-write-service/  # Command service (PostgreSQL Writer)
-│   ├── api-read-service/   # Query service (PostgreSQL Reader)
-│   ├── worker-service/     # Background event processor (Stock & Inventory)
-│   ├── shared/             # Common DB pools and TypeScript types
-│   └── scripts/            # Load testing and utility scripts
-└── .gitignore              # Project-wide git exclusions
 ```
 
 ## Core Workflows
