@@ -80,6 +80,19 @@ export class OrderServiceStack extends cdk.Stack {
       },
     });
 
+    // Enable Container Insights for Cluster Metrics
+    new eks.HelmChart(this, 'CloudWatchContainerInsights', {
+      cluster,
+      chart: 'aws-cloudwatch-metrics',
+      repository: 'https://aws.github.io/eks-charts',
+      namespace: 'amazon-cloudwatch',
+      createNamespace: true,
+      values: {
+        clusterName: cluster.clusterName,
+        region: this.region,
+      }
+    });
+
     dbCluster.connections.allowFrom(cluster.clusterSecurityGroup, ec2.Port.tcp(5432));
     redisSecurityGroup.addIngressRule(cluster.clusterSecurityGroup, ec2.Port.tcp(6379));
 
@@ -97,6 +110,12 @@ export class OrderServiceStack extends cdk.Stack {
     const readSvcSA = cluster.addServiceAccount('ReadServiceSA', { name: 'read-service-sa', namespace: 'default' });
     const procSvcSA = cluster.addServiceAccount('ProcessorServiceSA', { name: 'processor-service-sa', namespace: 'default' });
     const notifSvcSA = cluster.addServiceAccount('NotificationServiceSA', { name: 'notification-service-sa', namespace: 'default' });
+
+    // Grant Observability Permissions (Logs, Metrics, Traces) to all services
+    [writeSvcSA, readSvcSA, procSvcSA, notifSvcSA].forEach(sa => {
+      sa.role.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('CloudWatchAgentServerPolicy'));
+      sa.role.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('AWSXRayDaemonWriteAccess'));
+    });
 
     if (dbCluster.secret) {
       dbCluster.secret.grantRead(writeSvcSA.role);
