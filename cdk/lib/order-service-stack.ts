@@ -57,7 +57,7 @@ export class OrderServiceStack extends cdk.Stack {
     const redshiftNamespace = new redshiftserverless.CfnNamespace(this, 'AnalyticsNamespace', {
       namespaceName: 'order-analytics',
       adminUsername: 'admin',
-      adminUserPassword: cdk.SecretValue.unsafePlainText('TemporaryPassword123!').toString(), // Should use Secrets Manager in prod
+      adminUserPassword: cdk.SecretValue.unsafePlainText('TemporaryPassword123!').unsafeUnwrap(), // Use unsafeUnwrap() for L1 construct to satisfy validation
     });
 
     const redshiftWorkgroup = new redshiftserverless.CfnWorkgroup(this, 'AnalyticsWorkgroup', {
@@ -191,8 +191,24 @@ export class OrderServiceStack extends cdk.Stack {
     const api = new apigateway.RestApi(this, 'OrderApi', {
       restApiName: 'Order Service API',
       description: 'Gateway for Order Processing System',
+      deployOptions: { tracingEnabled: true },
     });
-    // In a real scenario, we would link this to the ALB or use VPC Link
+
+    const orders = api.root.addResource('orders');
+    
+    // Placeholder POST /orders (Write Service)
+    orders.addMethod('POST', new apigateway.MockIntegration({
+      integrationResponses: [{ statusCode: '201' }],
+      passthroughBehavior: apigateway.PassthroughBehavior.NEVER,
+      requestTemplates: { 'application/json': '{ "statusCode": 201 }' },
+    }), { methodResponses: [{ statusCode: '201' }] });
+
+    // Placeholder GET /orders (Read Service)
+    orders.addMethod('GET', new apigateway.MockIntegration({
+      integrationResponses: [{ statusCode: '200' }],
+      passthroughBehavior: apigateway.PassthroughBehavior.NEVER,
+      requestTemplates: { 'application/json': '{ "statusCode": 200 }' },
+    }), { methodResponses: [{ statusCode: '200' }] });
 
     // 10. CloudWatch Dashboard
     const dashboard = new cloudwatch.Dashboard(this, 'OrderServiceDashboard', {
