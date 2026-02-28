@@ -2,15 +2,6 @@
 
 This directory contains the AWS CDK (Cloud Development Kit) code to deploy the **Order Processing System** on AWS using TypeScript.
 
-## Infrastructure Components
-
-- **VPC:** Custom VPC with 2 Availability Zones and NAT Gateway for private subnet connectivity.
-- **EKS Cluster:** Managed Kubernetes cluster (v1.28) with node groups and Load Balancer controller.
-- **Aurora PostgreSQL:** Serverless v2 cluster with Writer and Reader endpoints.
-- **EventBridge Bus:** Central event bus for service communication.
-- **SQS Queues:** Buffering queues for event-driven workers.
-- **IAM (IRSA):** Least-privileged IAM roles mapped to Kubernetes service accounts.
-
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) (v20+)
@@ -34,6 +25,13 @@ This directory contains the AWS CDK (Cloud Development Kit) code to deploy the *
     ```bash
     npx cdk synth
     ```
+    
+4.  **Visualize Cloudformation Template:**
+    ```bash
+    npx cdk-dia
+    ```
+    This generates a [dot diagram](diagram.dot) and [preview image](diagram.png)
+
 
 4.  **Deploy the Stack:**
     ```bash

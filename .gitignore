@@ -17,6 +17,7 @@ dist/
 cdk.out/
 .cdk.staging/
 .parcel-cache/
+cdk/diagram.dot
 
 # Environment variables
 .env
