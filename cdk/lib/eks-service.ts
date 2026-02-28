@@ -51,14 +51,16 @@ export class EksService extends Construct {
       mainContainer.ports = [{ containerPort: props.containerPort }];
     }
 
-    if (props.healthCheckPath && props.healthCheckPort) {
+    const healthCheckPort = props.healthCheckPort ?? props.containerPort;
+
+    if (props.healthCheckPath && healthCheckPort) {
       mainContainer.livenessProbe = {
-        httpGet: { path: props.healthCheckPath, port: props.healthCheckPort },
+        httpGet: { path: props.healthCheckPath, port: healthCheckPort },
         initialDelaySeconds: 30,
         periodSeconds: 15,
       };
       mainContainer.readinessProbe = {
-        httpGet: { path: props.healthCheckPath, port: props.healthCheckPort },
+        httpGet: { path: props.healthCheckPath, port: healthCheckPort },
         initialDelaySeconds: 5,
         periodSeconds: 10,
       };

@@ -5,8 +5,9 @@ import * as rds from 'aws-cdk-lib/aws-rds';
 import * as eks from 'aws-cdk-lib/aws-eks';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
-import * as eventbridge from 'aws-cdk-lib/aws-events';
-import * as targets from 'aws-cdk-lib/aws-events-targets';
+import * as elasticache from 'aws-cdk-lib/aws-elasticache';
+import * as redshiftserverless from 'aws-cdk-lib/aws-redshiftserverless';
+import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import { KubectlV28Layer } from '@aws-cdk/lambda-layer-kubectl-v28';
 import { EksService } from './eks-service';
@@ -21,7 +22,7 @@ export class OrderServiceStack extends cdk.Stack {
       natGateways: 1,
     });
 
-    // 2. Aurora PostgreSQL Cluster
+    // 2. Aurora PostgreSQL Cluster (Writer & Reader)
     const dbCluster = new rds.DatabaseCluster(this, 'OrderDatabase', {
       engine: rds.DatabaseClusterEngine.auroraPostgres({
         version: rds.AuroraPostgresEngineVersion.VER_15_3,
@@ -36,7 +37,38 @@ export class OrderServiceStack extends cdk.Stack {
       defaultDatabaseName: 'retail',
     });
 
-    // 3. EKS Cluster
+    // 3. ElastiCache Redis (for Read Service)
+    const redisSubnetGroup = new elasticache.CfnSubnetGroup(this, 'RedisSubnetGroup', {
+      description: 'Subnet group for Redis',
+      subnetIds: vpc.privateSubnets.map(s => s.subnetId),
+    });
+
+    const redisSecurityGroup = new ec2.SecurityGroup(this, 'RedisSG', { vpc });
+    
+    const redisCluster = new elasticache.CfnCacheCluster(this, 'OrderCache', {
+      cacheNodeType: 'cache.t3.micro',
+      engine: 'redis',
+      numCacheNodes: 1,
+      cacheSubnetGroupName: redisSubnetGroup.ref,
+      vpcSecurityGroupIds: [redisSecurityGroup.securityGroupId],
+    });
+
+    // 4. Redshift Serverless (Business Analytics)
+    const redshiftNamespace = new redshiftserverless.CfnNamespace(this, 'AnalyticsNamespace', {
+      namespaceName: 'order-analytics',
+      adminUsername: 'admin',
+      adminUserPassword: cdk.SecretValue.unsafePlainText('TemporaryPassword123!').toString(), // Should use Secrets Manager in prod
+    });
+
+    const redshiftWorkgroup = new redshiftserverless.CfnWorkgroup(this, 'AnalyticsWorkgroup', {
+      workgroupName: 'order-analytics-workgroup',
+      namespaceName: redshiftNamespace.namespaceName,
+      subnetIds: vpc.privateSubnets.map(s => s.subnetId),
+      securityGroupIds: [new ec2.SecurityGroup(this, 'RedshiftSG', { vpc }).securityGroupId],
+      publiclyAccessible: false,
+    });
+
+    // 5. EKS Cluster
     const cluster = new eks.Cluster(this, 'OrderServiceCluster', {
       vpc,
       version: eks.KubernetesVersion.V1_28,
@@ -48,129 +80,113 @@ export class OrderServiceStack extends cdk.Stack {
       },
     });
 
-    // Enable Container Insights
-    new eks.HelmChart(this, 'CloudWatchContainerInsights', {
-      cluster,
-      chart: 'aws-cloudwatch-metrics',
-      repository: 'https://aws.github.io/eks-charts',
-      namespace: 'amazon-cloudwatch',
-      createNamespace: true,
-      values: {
-        clusterName: cluster.clusterName,
-        region: this.region,
-      }
-    });
-
     dbCluster.connections.allowFrom(cluster.clusterSecurityGroup, ec2.Port.tcp(5432));
+    redisSecurityGroup.addIngressRule(cluster.clusterSecurityGroup, ec2.Port.tcp(6379));
 
-    // 4. EventBridge and SQS
-    const eventBus = new eventbridge.EventBus(this, 'OrderEventBus', {
-      eventBusName: 'OrderEventBus',
-    });
-
-    const stockValidationQueue = new sqs.Queue(this, 'StockValidationQueue', {
+    // 6. SQS Queues
+    const orderQueue = new sqs.Queue(this, 'OrderQueue', {
       visibilityTimeout: cdk.Duration.seconds(30),
     });
-    new eventbridge.Rule(this, 'OrderCreatedRule', {
-      eventBus: eventBus,
-      eventPattern: { source: ['com.retailer.orders'], detailType: ['OrderCreated'] },
-      targets: [new targets.SqsQueue(stockValidationQueue)],
-    });
 
-    const inventoryUpdateQueue = new sqs.Queue(this, 'InventoryUpdateQueue', {
+    const notificationQueue = new sqs.Queue(this, 'NotificationQueue', {
       visibilityTimeout: cdk.Duration.seconds(30),
     });
-    new eventbridge.Rule(this, 'StockValidatedRule', {
-      eventBus: eventBus,
-      eventPattern: { source: ['com.retailer.orders'], detailType: ['StockValidated'] },
-      targets: [new targets.SqsQueue(inventoryUpdateQueue)],
-    });
 
-    // 5. IAM Roles for Service Accounts (IRSA)
-    const serviceAccount = cluster.addServiceAccount('OrderServiceAppAccount', {
-      name: 'order-service-sa',
-      namespace: 'default',
-    });
+    // 7. IAM Roles for Service Accounts (IRSA)
+    const writeSvcSA = cluster.addServiceAccount('WriteServiceSA', { name: 'write-service-sa', namespace: 'default' });
+    const readSvcSA = cluster.addServiceAccount('ReadServiceSA', { name: 'read-service-sa', namespace: 'default' });
+    const procSvcSA = cluster.addServiceAccount('ProcessorServiceSA', { name: 'processor-service-sa', namespace: 'default' });
+    const notifSvcSA = cluster.addServiceAccount('NotificationServiceSA', { name: 'notification-service-sa', namespace: 'default' });
 
     if (dbCluster.secret) {
-      dbCluster.secret.grantRead(serviceAccount.role);
+      dbCluster.secret.grantRead(writeSvcSA.role);
+      dbCluster.secret.grantRead(readSvcSA.role);
+      dbCluster.secret.grantRead(procSvcSA.role);
     }
-    eventBus.grantPutEventsTo(serviceAccount.role);
-    stockValidationQueue.grantConsumeMessages(serviceAccount.role);
-    inventoryUpdateQueue.grantConsumeMessages(serviceAccount.role);
-    serviceAccount.role.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('CloudWatchAgentServerPolicy'));
 
-    // 6. Application Services using common construct
+    orderQueue.grantSendMessages(writeSvcSA.role);
+    orderQueue.grantConsumeMessages(procSvcSA.role);
+    notificationQueue.grantSendMessages(procSvcSA.role);
+    notificationQueue.grantConsumeMessages(notifSvcSA.role);
+
+    // SES Permission for Notification Service
+    notifSvcSA.role.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSESFullAccess'));
+
+    // 8. Application Services
     const commonEnv = {
       DB_SECRET_ARN: dbCluster.secret?.secretArn || '',
       DB_WRITER_ENDPOINT: dbCluster.clusterEndpoint.hostname,
       DB_READER_ENDPOINT: dbCluster.clusterReadEndpoint.hostname,
-      EVENT_BUS_NAME: eventBus.eventBusName,
-      STOCK_VALIDATION_QUEUE_URL: stockValidationQueue.queueUrl,
-      INVENTORY_UPDATE_QUEUE_URL: inventoryUpdateQueue.queueUrl,
       AWS_REGION: this.region,
     };
 
-    // API WRITE SERVICE
-    new EksService(this, 'ApiWriteService', {
+    // WRITE SERVICE
+    new EksService(this, 'WriteService', {
       cluster,
-      serviceName: 'api-write-service',
+      serviceName: 'write-service',
       image: 'amazon/amazon-ecs-sample',
       containerPort: 3000,
-      healthCheckPath: '/health/deep',
-      healthCheckPort: 3000,
-      env: commonEnv,
-      minReplicas: 2,
-      maxReplicas: 10,
-      serviceAccountName: serviceAccount.serviceAccountName,
+      healthCheckPath: '/health',
+      env: { ...commonEnv, ORDER_QUEUE_URL: orderQueue.queueUrl },
+      serviceAccountName: writeSvcSA.serviceAccountName,
       isPublic: true,
     });
 
-    // API READ SERVICE
-    new EksService(this, 'ApiReadService', {
+    // READ SERVICE
+    new EksService(this, 'ReadService', {
       cluster,
-      serviceName: 'api-read-service',
+      serviceName: 'read-service',
       image: 'amazon/amazon-ecs-sample',
       containerPort: 3001,
-      healthCheckPath: '/health/deep',
-      healthCheckPort: 3001,
-      env: commonEnv,
-      minReplicas: 2,
-      maxReplicas: 20,
-      serviceAccountName: serviceAccount.serviceAccountName,
+      healthCheckPath: '/health',
+      env: { ...commonEnv, REDIS_ENDPOINT: redisCluster.attrRedisEndpointAddress },
+      serviceAccountName: readSvcSA.serviceAccountName,
       isPublic: true,
     });
 
-    // WORKER SERVICE
-    new EksService(this, 'WorkerService', {
+    // PROCESSOR SERVICE
+    new EksService(this, 'ProcessorService', {
       cluster,
-      serviceName: 'worker-service',
+      serviceName: 'processor-service',
       image: 'amazon/amazon-ecs-sample',
-      containerPort: 3002, // Health check port
-      healthCheckPath: '/health/deep',
-      healthCheckPort: 3002,
-      env: commonEnv,
-      minReplicas: 2,
-      maxReplicas: 20,
-      serviceAccountName: serviceAccount.serviceAccountName,
+      containerPort: 3002,
+      healthCheckPath: '/health',
+      env: { ...commonEnv, ORDER_QUEUE_URL: orderQueue.queueUrl, NOTIFICATION_QUEUE_URL: notificationQueue.queueUrl },
+      serviceAccountName: procSvcSA.serviceAccountName,
       isPublic: false,
     });
 
-    // 7. CloudWatch Dashboard
+    // NOTIFICATION SERVICE
+    new EksService(this, 'NotificationService', {
+      cluster,
+      serviceName: 'notification-service',
+      image: 'amazon/amazon-ecs-sample',
+      containerPort: 3003,
+      healthCheckPath: '/health',
+      env: { ...commonEnv, NOTIFICATION_QUEUE_URL: notificationQueue.queueUrl },
+      serviceAccountName: notifSvcSA.serviceAccountName,
+      isPublic: false,
+    });
+
+    // 9. API Gateway (Frontend for the System)
+    const api = new apigateway.RestApi(this, 'OrderApi', {
+      restApiName: 'Order Service API',
+      description: 'Gateway for Order Processing System',
+    });
+    // In a real scenario, we would link this to the ALB or use VPC Link
+
+    // 10. CloudWatch Dashboard
     const dashboard = new cloudwatch.Dashboard(this, 'OrderServiceDashboard', {
       dashboardName: 'OrderProcessingSystem',
     });
 
     dashboard.addWidgets(
-      new cloudwatch.TextWidget({ markdown: '# Order Processing System Metrics', width: 24, height: 2 })
-    );
-
-    dashboard.addWidgets(
+      new cloudwatch.TextWidget({ markdown: '# Order Processing System Metrics', width: 24, height: 2 }),
       new cloudwatch.GraphWidget({
         title: 'SQS Queue Depth',
         left: [
-          stockValidationQueue.metricApproximateNumberOfMessagesVisible({ label: 'Stock Validation' }),
-          inventoryUpdateQueue.metricApproximateNumberOfMessagesVisible({ label: 'Inventory Update' }),
+          orderQueue.metricApproximateNumberOfMessagesVisible({ label: 'Order Queue' }),
+          notificationQueue.metricApproximateNumberOfMessagesVisible({ label: 'Notification Queue' }),
         ],
         width: 12,
       }),
